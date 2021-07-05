@@ -10,12 +10,22 @@ import {BaseStrategy, StrategyParams} from "@yearnvaults/contracts/BaseStrategy.
 import {SafeERC20, SafeMath, IERC20, Address} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 
 // Import interfaces for many popular DeFi projects, or add your own!
-//import "../interfaces/<protocol>/<Interface>.sol";
+import {IMasterChef} from "../interfaces/sushi/IMasterChef.sol";
+import {IUniswapRouterV2} from "../interfaces/uniswap/IUniswapRouterV2.sol";
 
 contract Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
     using SafeMath for uint256;
+
+    IERC20 public reward; // TODO: Token we farm, probably Sushi
+    uint256 public pid = 0; // TODO: Pool ID
+
+    address public WETH; // TODO: To swap, make sure to set it up!!!
+
+    IMasterChef public MASTERCHEF; // TODO: Address of Sushi Staking Contract
+
+    IUniswapRouterV2 public ROUTER; // TODO: SwapRouter Address
 
     constructor(address _vault) public BaseStrategy(_vault) {
         // You can set these parameters on deployment to whatever you want
@@ -28,12 +38,14 @@ contract Strategy is BaseStrategy {
 
     function name() external view override returns (string memory) {
         // Add your own name here, suggestion e.g. "StrategyCreamYFI"
-        return "Strategy<ProtocolName><TokenType>";
+        return "StrategySushiGeneric";
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
+        (uint256 staked, ) = MASTERCHEF.userInfo(pid, address(this));
+
         // TODO: Build a more accurate estimate using the value of all positions in terms of `want`
-        return want.balanceOf(address(this));
+        return want.balanceOf(address(this)).add(staked);
     }
 
     function prepareReturn(uint256 _debtOutstanding)
@@ -50,14 +62,40 @@ contract Strategy is BaseStrategy {
         // NOTE: Should try to free up at least `_debtOutstanding` of underlying position
         // This would be the old harvest, where you just report _profit, _loss and _debtPayment
 
+        MASTERCHEF.harvest(pid, address(this));
+
+        uint256 toSwap = reward.balanceOf(address(this));
+
+        // TODO: Swap into want
+        uint256 profit = _swapToWant(toSwap);
+
+        // Deal with debt
+        if (profit > _debtOutstanding) {
+            // can repay all, let's do that
+            _debtPayment = _debtOutstanding;
+        } else {
+            _debtPayment = profit;
+        }
+        _loss = 0; // Can't loose funds, unless rugged
+
+        _profit = profit.sub(_debtPayment);
+
         // NOTE: This is here just for tests to pass (so strat repays all it owes at all times)
-        _debtPayment = _debtOutstanding;
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
         // TODO: Do something to invest excess `want` tokens (from the Vault) into your positions
         // NOTE: Try to adjust positions so that `_debtOutstanding` can be freed up on *next* harvest (not immediately)
         // This is tend, not much to change here
+        uint256 _preWant = want.balanceOf(address(this));
+        if (_preWant > _debtOutstanding) {
+            uint256 toDeposit = _preWant.sub(_debtOutstanding);
+
+            // Get balance minus debt
+            // Deposit that
+            want.approve(address(MASTERCHEF), toDeposit);
+            MASTERCHEF.deposit(pid, toDeposit);
+        }
     }
 
     function liquidatePosition(uint256 _amountNeeded)
@@ -71,6 +109,17 @@ contract Strategy is BaseStrategy {
 
         //This is basically withdrawSome
 
+        // Get idle want in the strategy
+        uint256 _preWant = want.balanceOf(address(this));
+
+        // If we lack sufficient idle want, withdraw the difference from the strategy position
+        if (_preWant < _amountNeeded) {
+            uint256 _toWithdraw = _amountNeeded.sub(_preWant);
+            MASTERCHEF.withdraw(pid, _toWithdraw);
+
+            // Note: Withdrawl process will earn rewards, this will be deposited into SushiBar on next adjustPositions()
+        }
+
         uint256 totalAssets = want.balanceOf(address(this));
         if (_amountNeeded > totalAssets) {
             _liquidatedAmount = totalAssets;
@@ -82,8 +131,12 @@ contract Strategy is BaseStrategy {
 
     function liquidateAllPositions() internal override returns (uint256) {
         // This is a generalization of withdrawAll that withdraws everything for the entire strat
+        (uint256 staked, ) = MASTERCHEF.userInfo(pid, address(this));
 
-        // TODO: Liquidate all positions and return the amount freed.
+        // Withdraw all want from Chef
+        MASTERCHEF.withdrawAndHarvest(pid, staked, address(this));
+
+        // TODO: Reap all rewards
         return want.balanceOf(address(this));
     }
 
@@ -93,6 +146,9 @@ contract Strategy is BaseStrategy {
         // TODO: Transfer any non-`want` tokens to the new strategy
         // NOTE: `migrate` will automatically forward all `want` in this strategy to the new one
         // This is gone if we use upgradeable
+
+        // Liquidate All positons
+        liquidateAllPositions();
     }
 
     // Override this to add all tokens/tokenized positions this contract manages
@@ -113,7 +169,11 @@ contract Strategy is BaseStrategy {
         view
         override
         returns (address[] memory)
-    {}
+    {
+        address[] memory protected = new address[](1);
+        // NOTE: May need to add lpComponent anyway
+        return protected;
+    }
 
     /**
      * @notice
@@ -138,5 +198,22 @@ contract Strategy is BaseStrategy {
     {
         // TODO create an accurate price oracle
         return _amtInWei;
+    }
+
+    /** STRATEGY UNIQUE CODE */
+    function _swapToWant(uint256 toSwap) internal returns (uint256) {
+        uint256 startingWantBalance = want.balanceOf(address(this));
+
+        address[] memory path = new address[](3);
+        path[0] = address(reward);
+        path[1] = WETH;
+        path[2] = address(want);
+
+        reward.approve(address(ROUTER), toSwap);
+
+        // Warning, no slippage checks, can be frontrun
+        ROUTER.swapExactTokensForTokens(toSwap, 0, path, address(this), now);
+
+        return want.balanceOf(address(this)).sub(startingWantBalance);
     }
 }
